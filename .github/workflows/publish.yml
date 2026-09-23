@@ -1,0 +1,22 @@
+name: publish
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: pip install -q cryptography requests
+      - name: Publish due posts
+        env:
+          TOKEN_KEY: ${{ secrets.TOKEN_KEY }}
+        run: python publisher/publish.py
