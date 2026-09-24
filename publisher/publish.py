@@ -1,4 +1,4 @@
-"""Runs on GitHub Actions every 30 minutes. Publishes queued Instagram posts
+"""Runs on GitHub Actions every 15 minutes. Publishes queued Instagram posts
 that are due. The Instagram token is stored encrypted in state/token.enc; the
 key is the TOKEN_KEY repository secret. The token is never printed."""
 import json
@@ -102,41 +102,93 @@ def publish_item(ig, item):
         children.append(cid)
     parent = ig.create({'media_type': 'CAROUSEL', 'children': ','.join(children), 'caption': item.get('caption', '')})
     ig.wait_ready(parent)
-    media_id = ig.publish(parent)
+    started = utcnow()
+    try:
+        media_id = ig.publish(parent)
+    except Exception:
+        # an error here does not prove it failed (e.g. a timeout after Instagram
+        # accepted it) -- look before reporting a failure, or a retry posts twice
+        live = find_live(ig, item, started - timedelta(minutes=5))
+        if not live:
+            raise
+        media_id = live['id']
     return media_id, ig.permalink(media_id)
+
+
+def find_live(ig, item, since):
+    """The recent post with this item's caption, or None."""
+    key = ' '.join(str(item.get('caption') or '').split())[:80]
+    if not key:
+        return None
+    for wait in (0, 8, 20):
+        time.sleep(wait)
+        try:
+            media = ig.request('GET', f'{ig.user_id}/media', params={
+                'fields': 'id,caption,timestamp,permalink', 'limit': 25, 'access_token': ig.token}).get('data', [])
+        except RuntimeError:
+            continue
+        for m in media:
+            if ' '.join(str(m.get('caption') or '').split())[:80] != key:
+                continue
+            try:
+                if parse_utc(m.get('timestamp', '').replace('+0000', '+00:00')) < since:
+                    continue
+            except ValueError:
+                pass
+            return m
+    return None
+
+
+def _git(*args):
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def git_pull():
+    """Latest queue from the app (a cancel = the queue file was deleted)."""
+    if os.environ.get('NO_GIT'):
+        return True
+    return _git('git', 'pull', '--rebase', '-X', 'theirs').returncode == 0
 
 
 def git_commit(message):
     """Commit + push immediately (rebasing on conflict) so a crash later in
-    the run can never cause an already-published post to be published again."""
+    the run can never cause an already-published post to be published again.
+    True when the change is on GitHub."""
     if os.environ.get('NO_GIT'):
-        return
-    def run(*args):
-        return subprocess.run(args, capture_output=True, text=True)
-    run('git', 'config', 'user.name', 'publisher-bot')
-    run('git', 'config', 'user.email', 'publisher-bot@users.noreply.github.com')
-    run('git', 'add', 'results', 'state')
-    if run('git', 'diff', '--cached', '--quiet').returncode == 0:
-        return
-    run('git', 'commit', '-m', message)
+        return True
+    _git('git', 'config', 'user.name', 'publisher-bot')
+    _git('git', 'config', 'user.email', 'publisher-bot@users.noreply.github.com')
+    _git('git', 'add', 'results', 'state')
+    if _git('git', 'diff', '--cached', '--quiet').returncode == 0:
+        return True
+    _git('git', 'commit', '-m', message)
     for _ in range(4):
-        if run('git', 'push').returncode == 0:
-            return
-        run('git', 'pull', '--rebase')
+        if _git('git', 'push').returncode == 0:
+            return True
+        if _git('git', 'pull', '--rebase', '-X', 'theirs').returncode != 0:
+            _git('git', 'rebase', '--abort')
     print('WARNING: could not push state', file=sys.stderr)
+    return False
 
 
-def main(now=None, publisher=publish_item):
+def main(now=None, publisher=publish_item, finder=find_live):
     now = now or utcnow()
     key = os.environ.get('TOKEN_KEY', '').encode()
     if not key or not TOKEN_FILE.exists():
         print('Not configured: missing TOKEN_KEY or state/token.enc')
         return 1
     meta = read_json(META_FILE, {})
-    due, missed = [], []
+    due, missed, interrupted = [], [], []
     for f in sorted(QUEUE_DIR.glob('*.json')):
         item = read_json(f, None)
-        if not item or (RESULTS_DIR / f.name).exists():
+        if not item:
+            continue
+        done = read_json(RESULTS_DIR / f.name, None)
+        if done is not None:
+            # runs never overlap (workflow concurrency), so a leftover 'publishing'
+            # claim means an earlier run died mid-publish: find out, never re-post blindly
+            if done.get('status') == 'publishing':
+                interrupted.append((f, item, done))
             continue
         try:
             when = parse_utc(item['when_utc'])
@@ -152,7 +204,7 @@ def main(now=None, publisher=publish_item):
     except Exception:
         issued = None
     need_refresh = issued is None or now - issued >= timedelta(days=REFRESH_AFTER_DAYS)
-    if not due and not missed and not need_refresh:
+    if not due and not missed and not interrupted and not need_refresh:
         print('Nothing to do.')
         return 0
 
@@ -167,7 +219,33 @@ def main(now=None, publisher=publish_item):
     if missed:
         git_commit('missed posts')
 
+    for f, item, claim in interrupted:
+        try:
+            since = parse_utc(claim.get('at')) - timedelta(minutes=10)
+        except Exception:
+            since = now - timedelta(days=2)
+        live = finder(ig, item, since)
+        result = {'id': item['id'], 'at': now.isoformat()}
+        if live:
+            result.update(status='published', media_id=live.get('id', ''), permalink=live.get('permalink', ''))
+        else:
+            result.update(status='failed', error='An earlier run stopped while publishing and the post is not on Instagram.')
+        write_json(RESULTS_DIR / f.name, result)
+        git_commit(f"recovered {item['id']}")
+
     for f, item in due:
+        # re-read the queue right before posting: the user may have cancelled it
+        git_pull()
+        if not f.exists():
+            print(f"Cancelled {item['id']}")
+            continue
+        # claim it on GitHub BEFORE posting, so a crash or a failed push later can
+        # never lead to a second post of the same item
+        write_json(RESULTS_DIR / f.name, {'id': item['id'], 'status': 'publishing', 'at': utcnow().isoformat()})
+        if not git_commit(f"publishing {item['id']}"):
+            (RESULTS_DIR / f.name).unlink()
+            print(f"Skipped {item['id']}: could not record the claim; will retry next run")
+            continue
         result = {'id': item['id'], 'at': now.isoformat()}
         try:
             media_id, permalink = publisher(ig, item)
