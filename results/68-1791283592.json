@@ -1,5 +1,6 @@
 {
-  "at": "2026-10-12T08:00:28.730666+00:00",
+  "at": "2026-10-12T07:59:18.328929+00:00",
+  "error": "HTTP 400: Only photo or video can be accepted as media type.",
   "id": "68-1791283592",
-  "status": "publishing"
+  "status": "failed"
 }
